@@ -1,7 +1,7 @@
 use std::{cmp::max, collections::BTreeMap};
 
 use axum::extract::State;
-use conduit::{debug_info, debug_warn};
+use conduit::{debug_info, debug_warn, err};
 use ruma::{
 	api::client::{
 		error::ErrorKind,
@@ -139,13 +139,8 @@ pub(crate) async fn create_room_route(
 						})?,
 					);
 				},
-				V11 => {}, // V11 removed the "creator" key
 				_ => {
-					warn!("Unexpected or unsupported room version {room_version}");
-					return Err(Error::BadRequest(
-						ErrorKind::BadJson,
-						"Unexpected or unsupported room version found",
-					));
+					// V11+ removed the "creator" key
 				},
 			}
 			content.insert(
@@ -161,14 +156,7 @@ pub(crate) async fn create_room_route(
 
 			let content = match room_version {
 				V1 | V2 | V3 | V4 | V5 | V6 | V7 | V8 | V9 | V10 => RoomCreateEventContent::new_v1(sender_user.clone()),
-				V11 => RoomCreateEventContent::new_v11(),
-				_ => {
-					warn!("Unexpected or unsupported room version {room_version}");
-					return Err(Error::BadRequest(
-						ErrorKind::BadJson,
-						"Unexpected or unsupported room version found",
-					));
-				},
+				_ => RoomCreateEventContent::new_v11(),
 			};
 			let mut content = serde_json::from_str::<CanonicalJsonObject>(
 				to_raw_value(&content)
@@ -197,6 +185,7 @@ pub(crate) async fn create_room_route(
 				unsigned: None,
 				state_key: Some(String::new()),
 				redacts: None,
+				timestamp: None,
 			},
 			sender_user,
 			&room_id,
@@ -225,6 +214,7 @@ pub(crate) async fn create_room_route(
 				unsigned: None,
 				state_key: Some(sender_user.to_string()),
 				redacts: None,
+				timestamp: None,
 			},
 			sender_user,
 			&room_id,
@@ -262,6 +252,7 @@ pub(crate) async fn create_room_route(
 				unsigned: None,
 				state_key: Some(String::new()),
 				redacts: None,
+				timestamp: None,
 			},
 			sender_user,
 			&room_id,
@@ -285,6 +276,7 @@ pub(crate) async fn create_room_route(
 					unsigned: None,
 					state_key: Some(String::new()),
 					redacts: None,
+					timestamp: None,
 				},
 				sender_user,
 				&room_id,
@@ -311,6 +303,7 @@ pub(crate) async fn create_room_route(
 				unsigned: None,
 				state_key: Some(String::new()),
 				redacts: None,
+				timestamp: None,
 			},
 			sender_user,
 			&room_id,
@@ -330,6 +323,7 @@ pub(crate) async fn create_room_route(
 				unsigned: None,
 				state_key: Some(String::new()),
 				redacts: None,
+				timestamp: None,
 			},
 			sender_user,
 			&room_id,
@@ -352,6 +346,7 @@ pub(crate) async fn create_room_route(
 				unsigned: None,
 				state_key: Some(String::new()),
 				redacts: None,
+				timestamp: None,
 			},
 			sender_user,
 			&room_id,
@@ -405,6 +400,7 @@ pub(crate) async fn create_room_route(
 					unsigned: None,
 					state_key: Some(String::new()),
 					redacts: None,
+					timestamp: None,
 				},
 				sender_user,
 				&room_id,
@@ -427,6 +423,7 @@ pub(crate) async fn create_room_route(
 					unsigned: None,
 					state_key: Some(String::new()),
 					redacts: None,
+					timestamp: None,
 				},
 				sender_user,
 				&room_id,
@@ -475,10 +472,7 @@ pub(crate) async fn get_room_event_route(
 		.rooms
 		.timeline
 		.get_pdu(&body.event_id)?
-		.ok_or_else(|| {
-			warn!("Event not found, event ID: {:?}", &body.event_id);
-			Error::BadRequest(ErrorKind::NotFound, "Event not found.")
-		})?;
+		.ok_or_else(|| err!(Request(NotFound("Event {} not found.", &body.event_id))))?;
 
 	if !services
 		.rooms
@@ -584,6 +578,7 @@ pub(crate) async fn upgrade_room_route(
 				unsigned: None,
 				state_key: Some(String::new()),
 				redacts: None,
+				timestamp: None,
 			},
 			sender_user,
 			&body.room_id,
@@ -627,16 +622,9 @@ pub(crate) async fn upgrade_room_route(
 					})?,
 				);
 			},
-			V11 => {
-				// "creator" key no longer exists in V11 rooms
-				create_event_content.remove("creator");
-			},
 			_ => {
-				warn!("Unexpected or unsupported room version {}", body.new_version);
-				return Err(Error::BadRequest(
-					ErrorKind::BadJson,
-					"Unexpected or unsupported room version found",
-				));
+				// "creator" key no longer exists in V11+ rooms
+				create_event_content.remove("creator");
 			},
 		}
 	}
@@ -675,6 +663,7 @@ pub(crate) async fn upgrade_room_route(
 				unsigned: None,
 				state_key: Some(String::new()),
 				redacts: None,
+				timestamp: None,
 			},
 			sender_user,
 			&replacement_room,
@@ -703,6 +692,7 @@ pub(crate) async fn upgrade_room_route(
 				unsigned: None,
 				state_key: Some(sender_user.to_string()),
 				redacts: None,
+				timestamp: None,
 			},
 			sender_user,
 			&replacement_room,
@@ -731,6 +721,7 @@ pub(crate) async fn upgrade_room_route(
 					unsigned: None,
 					state_key: Some(String::new()),
 					redacts: None,
+					timestamp: None,
 				},
 				sender_user,
 				&replacement_room,
@@ -746,6 +737,11 @@ pub(crate) async fn upgrade_room_route(
 		.local_aliases_for_room(&body.room_id)
 		.filter_map(Result::ok)
 	{
+		services
+			.rooms
+			.alias
+			.remove_alias(&alias, sender_user)
+			.await?;
 		services
 			.rooms
 			.alias
@@ -789,6 +785,7 @@ pub(crate) async fn upgrade_room_route(
 				unsigned: None,
 				state_key: Some(String::new()),
 				redacts: None,
+				timestamp: None,
 			},
 			sender_user,
 			&body.room_id,

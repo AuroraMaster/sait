@@ -1,4 +1,5 @@
 use std::{
+	fmt::Write,
 	panic::AssertUnwindSafe,
 	sync::{Arc, Mutex},
 	time::SystemTime,
@@ -22,13 +23,14 @@ use ruma::{
 		relation::InReplyTo,
 		room::message::{Relation::Reply, RoomMessageEventContent},
 	},
-	OwnedEventId,
+	EventId,
 };
 use service::{
-	admin::{CommandInput, CommandOutput, HandlerFuture, HandlerResult},
+	admin::{CommandInput, CommandOutput, ProcessorFuture, ProcessorResult},
 	Services,
 };
 use tracing::Level;
+use tracing_subscriber::{filter::LevelFilter, EnvFilter};
 
 use crate::{admin, admin::AdminCommand, Command};
 
@@ -36,22 +38,22 @@ use crate::{admin, admin::AdminCommand, Command};
 pub(super) fn complete(line: &str) -> String { complete_command(AdminCommand::command(), line) }
 
 #[must_use]
-pub(super) fn handle(services: Arc<Services>, command: CommandInput) -> HandlerFuture {
+pub(super) fn dispatch(services: Arc<Services>, command: CommandInput) -> ProcessorFuture {
 	Box::pin(handle_command(services, command))
 }
 
 #[tracing::instrument(skip_all, name = "admin")]
-async fn handle_command(services: Arc<Services>, command: CommandInput) -> HandlerResult {
+async fn handle_command(services: Arc<Services>, command: CommandInput) -> ProcessorResult {
 	AssertUnwindSafe(Box::pin(process_command(services, &command)))
 		.catch_unwind()
 		.await
 		.map_err(Error::from_panic)
-		.or_else(|error| handle_panic(&error, command))
+		.unwrap_or_else(|error| handle_panic(&error, &command))
 }
 
-async fn process_command(services: Arc<Services>, input: &CommandInput) -> CommandOutput {
+async fn process_command(services: Arc<Services>, input: &CommandInput) -> ProcessorResult {
 	let (command, args, body) = match parse(&services, input) {
-		Err(error) => return error,
+		Err(error) => return Err(error),
 		Ok(parsed) => parsed,
 	};
 
@@ -59,44 +61,23 @@ async fn process_command(services: Arc<Services>, input: &CommandInput) -> Comma
 		services: &services,
 		body: &body,
 		timer: SystemTime::now(),
+		reply_id: input.reply_id.as_deref(),
 	};
 
-	process(&context, command, &args)
-		.await
-		.and_then(|content| reply(content, input.reply_id.clone()))
+	process(&context, command, &args).await
 }
 
-fn handle_panic(error: &Error, command: CommandInput) -> HandlerResult {
+fn handle_panic(error: &Error, command: &CommandInput) -> ProcessorResult {
 	let link = "Please submit a [bug report](https://github.com/girlbossceo/conduwuit/issues/new). 🥺";
 	let msg = format!("Panic occurred while processing command:\n```\n{error:#?}\n```\n{link}");
 	let content = RoomMessageEventContent::notice_markdown(msg);
 	error!("Panic while processing command: {error:?}");
-	Ok(reply(content, command.reply_id))
-}
-
-fn reply(mut content: RoomMessageEventContent, reply_id: Option<OwnedEventId>) -> Option<RoomMessageEventContent> {
-	content.relates_to = reply_id.map(|event_id| Reply {
-		in_reply_to: InReplyTo {
-			event_id,
-		},
-	});
-
-	Some(content)
+	Err(reply(content, command.reply_id.as_deref()))
 }
 
 // Parse and process a message from the admin room
-async fn process(context: &Command<'_>, command: AdminCommand, args: &[String]) -> CommandOutput {
-	let filter: &capture::Filter =
-		&|data| data.level() <= Level::DEBUG && data.our_modules() && data.scope.contains(&"admin");
-	let logs = Arc::new(Mutex::new(
-		collect_stream(|s| markdown_table_head(s)).expect("markdown table header"),
-	));
-
-	let capture = Capture::new(
-		&context.services.server.log.capture,
-		Some(filter),
-		capture::fmt(markdown_table, logs.clone()),
-	);
+async fn process(context: &Command<'_>, command: AdminCommand, args: &[String]) -> ProcessorResult {
+	let (capture, logs) = capture_create(context);
 
 	let capture_scope = capture.start();
 	let result = Box::pin(admin::process(command, context)).await;
@@ -109,13 +90,50 @@ async fn process(context: &Command<'_>, command: AdminCommand, args: &[String]) 
 		"command processed"
 	);
 
-	let logs = logs.lock().expect("locked");
-	let output = match result {
-		Err(error) => format!("{logs}\nEncountered an error while handling the command:\n```\n{error:#?}\n```"),
-		Ok(reply) => format!("{logs}\n{}", reply.body()), //TODO: content is recreated to add logs
-	};
+	let mut output = String::new();
 
-	Some(RoomMessageEventContent::notice_markdown(output))
+	// Prepend the logs only if any were captured
+	let logs = logs.lock().expect("locked");
+	if logs.lines().count() > 2 {
+		writeln!(&mut output, "{logs}").expect("failed to format logs to command output");
+	}
+	drop(logs);
+
+	match result {
+		Ok(content) => {
+			write!(&mut output, "{0}", content.body()).expect("failed to format command result to output buffer");
+			Ok(Some(reply(RoomMessageEventContent::notice_markdown(output), context.reply_id)))
+		},
+		Err(error) => {
+			write!(&mut output, "Command failed with error:\n```\n{error:#?}\n```")
+				.expect("failed to format command result to output");
+			Err(reply(RoomMessageEventContent::notice_markdown(output), context.reply_id))
+		},
+	}
+}
+
+fn capture_create(context: &Command<'_>) -> (Arc<Capture>, Arc<Mutex<String>>) {
+	let env_config = &context.services.server.config.admin_log_capture;
+	let env_filter = EnvFilter::try_new(env_config).unwrap_or_else(|_| "debug".into());
+	let log_level = env_filter
+		.max_level_hint()
+		.and_then(LevelFilter::into_level)
+		.unwrap_or(Level::DEBUG);
+
+	let filter =
+		move |data: capture::Data<'_>| data.level() <= log_level && data.our_modules() && data.scope.contains(&"admin");
+
+	let logs = Arc::new(Mutex::new(
+		collect_stream(|s| markdown_table_head(s)).expect("markdown table header"),
+	));
+
+	let capture = Capture::new(
+		&context.services.server.log.capture,
+		Some(filter),
+		capture::fmt(markdown_table, logs.clone()),
+	);
+
+	(capture, logs)
 }
 
 // Parse chat messages from the admin room into an AdminCommand object
@@ -131,7 +149,10 @@ fn parse<'a>(
 			let message = error
 				.to_string()
 				.replace("server.name", services.globals.server_name().as_str());
-			Err(Some(RoomMessageEventContent::notice_markdown(message)))
+			Err(reply(
+				RoomMessageEventContent::notice_markdown(message),
+				input.reply_id.as_deref(),
+			))
 		},
 	}
 }
@@ -227,4 +248,14 @@ fn parse_line(command_line: &str) -> Vec<String> {
 
 	trace!(?command_line, ?argv, "parse");
 	argv
+}
+
+fn reply(mut content: RoomMessageEventContent, reply_id: Option<&EventId>) -> RoomMessageEventContent {
+	content.relates_to = reply_id.map(|event_id| Reply {
+		in_reply_to: InReplyTo {
+			event_id: event_id.to_owned(),
+		},
+	});
+
+	content
 }

@@ -449,7 +449,7 @@ impl Service {
 							}
 						}
 					},
-					V11 => {
+					_ => {
 						let content =
 							serde_json::from_str::<RoomRedactionEventContent>(pdu.content.get()).map_err(|e| {
 								warn!("Invalid content in redaction pdu: {e}");
@@ -466,13 +466,6 @@ impl Service {
 								self.redact_pdu(redact_id, pdu, shortroomid)?;
 							}
 						}
-					},
-					_ => {
-						warn!("Unexpected or unsupported room version {room_version_id}");
-						return Err(Error::BadRequest(
-							ErrorKind::BadJson,
-							"Unexpected or unsupported room version found",
-						));
 					},
 				};
 			},
@@ -530,8 +523,7 @@ impl Service {
 					if self.services.admin.is_admin_command(pdu, &body).await {
 						self.services
 							.admin
-							.command(body, Some((*pdu.event_id).into()))
-							.await;
+							.command(body, Some((*pdu.event_id).into()))?;
 					}
 				}
 			},
@@ -638,6 +630,7 @@ impl Service {
 			unsigned,
 			state_key,
 			redacts,
+			timestamp,
 		} = pdu_builder;
 
 		let prev_events: Vec<_> = self
@@ -705,9 +698,14 @@ impl Service {
 			room_id: room_id.to_owned(),
 			sender: sender.to_owned(),
 			origin: None,
-			origin_server_ts: utils::millis_since_unix_epoch()
-				.try_into()
-				.expect("time is valid"),
+			origin_server_ts: timestamp.map_or_else(
+				|| {
+					utils::millis_since_unix_epoch()
+						.try_into()
+						.expect("u64 fits into UInt")
+				},
+				|ts| ts.get(),
+			),
 			kind: event_type,
 			content,
 			state_key,

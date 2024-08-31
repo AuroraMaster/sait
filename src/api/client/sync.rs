@@ -7,12 +7,13 @@ use std::{
 
 use axum::extract::State;
 use conduit::{
-	error,
+	debug, error,
 	utils::math::{ruma_from_u64, ruma_from_usize, usize_from_ruma, usize_from_u64_truncated},
-	Err, PduCount,
+	warn, Err, PduCount,
 };
 use ruma::{
 	api::client::{
+		error::ErrorKind,
 		filter::{FilterDefinition, LazyLoadOptions},
 		sync::sync_events::{
 			self,
@@ -20,7 +21,7 @@ use ruma::{
 				Ephemeral, Filter, GlobalAccountData, InviteState, InvitedRoom, JoinedRoom, LeftRoom, Presence,
 				RoomAccountData, RoomSummary, Rooms, State as RoomState, Timeline, ToDevice,
 			},
-			v4::SlidingOp,
+			v4::{SlidingOp, SlidingSyncRoomHero},
 			DeviceLists, UnreadNotificationsCount,
 		},
 		uiaa::UiaaResponse,
@@ -28,17 +29,39 @@ use ruma::{
 	events::{
 		presence::PresenceEvent,
 		room::member::{MembershipState, RoomMemberEventContent},
-		StateEventType, TimelineEventType,
+		AnyRawAccountDataEvent, StateEventType, TimelineEventType,
 	},
+	room::RoomType,
 	serde::Raw,
-	uint, DeviceId, EventId, OwnedUserId, RoomId, UInt, UserId,
+	state_res::Event,
+	uint, DeviceId, EventId, MilliSecondsSinceUnixEpoch, OwnedRoomId, OwnedUserId, RoomId, UInt, UserId,
 };
+use service::rooms::read_receipt::pack_receipts;
 use tracing::{Instrument as _, Span};
 
 use crate::{
 	service::{pdu::EventHash, Services},
 	utils, Error, PduEvent, Result, Ruma, RumaResponse,
 };
+
+const SINGLE_CONNECTION_SYNC: &str = "single_connection_sync";
+const DEFAULT_BUMP_TYPES: &[TimelineEventType] = &[
+	TimelineEventType::RoomMessage,
+	TimelineEventType::RoomEncrypted,
+	TimelineEventType::Sticker,
+	TimelineEventType::CallInvite,
+	TimelineEventType::PollStart,
+	TimelineEventType::Beacon,
+];
+
+macro_rules! extract_variant {
+	($e:expr, $variant:path) => {
+		match $e {
+			$variant(value) => Some(value),
+			_ => None,
+		}
+	};
+}
 
 /// # `GET /_matrix/client/r0/sync`
 ///
@@ -278,11 +301,7 @@ pub(crate) async fn sync_events_route(
 				.account_data
 				.changes_since(None, &sender_user, since)?
 				.into_iter()
-				.filter_map(|(_, v)| {
-					serde_json::from_str(v.json().get())
-						.map_err(|_| Error::bad_database("Invalid account event in database."))
-						.ok()
-				})
+				.filter_map(|e| extract_variant!(e, AnyRawAccountDataEvent::Global))
 				.collect(),
 		},
 		device_lists: DeviceLists {
@@ -323,7 +342,7 @@ pub(crate) async fn sync_events_route(
 #[tracing::instrument(skip_all, fields(user_id = %sender_user, room_id = %room_id), name = "left_room")]
 async fn handle_left_room(
 	services: &Services, since: u64, room_id: &RoomId, sender_user: &UserId,
-	left_rooms: &mut BTreeMap<ruma::OwnedRoomId, LeftRoom>, next_batch_string: &str, full_state: bool,
+	left_rooms: &mut BTreeMap<OwnedRoomId, LeftRoom>, next_batch_string: &str, full_state: bool,
 	lazy_load_enabled: bool,
 ) -> Result<()> {
 	// Get and drop the lock to wait for remaining operations to finish
@@ -975,11 +994,7 @@ async fn load_joined_room(
 				.account_data
 				.changes_since(Some(room_id), sender_user, since)?
 				.into_iter()
-				.filter_map(|(_, v)| {
-					serde_json::from_str(v.json().get())
-						.map_err(|_| Error::bad_database("Invalid account event in database."))
-						.ok()
-				})
+				.filter_map(|e| extract_variant!(e, AnyRawAccountDataEvent::Room))
 				.collect(),
 		},
 		summary: RoomSummary {
@@ -1078,7 +1093,7 @@ fn share_encrypted_room(
 /// Sliding Sync endpoint (future endpoint: `/_matrix/client/v4/sync`)
 pub(crate) async fn sync_events_v4_route(
 	State(services): State<crate::State>, body: Ruma<sync_events::v4::Request>,
-) -> Result<sync_events::v4::Response, RumaResponse<UiaaResponse>> {
+) -> Result<sync_events::v4::Response> {
 	let sender_user = body.sender_user.expect("user is authenticated");
 	let sender_device = body.sender_device.expect("user is authenticated");
 	let mut body = body.body;
@@ -1087,18 +1102,34 @@ pub(crate) async fn sync_events_v4_route(
 
 	let next_batch = services.globals.next_count()?;
 
+	let conn_id = body
+		.conn_id
+		.clone()
+		.unwrap_or_else(|| SINGLE_CONNECTION_SYNC.to_owned());
+
 	let globalsince = body
 		.pos
 		.as_ref()
 		.and_then(|string| string.parse().ok())
 		.unwrap_or(0);
 
+	if globalsince != 0
+		&& !services
+			.users
+			.remembered(sender_user.clone(), sender_device.clone(), conn_id.clone())
+	{
+		debug!("Restarting sync stream because it was gone from the database");
+		return Err(Error::Request(
+			ErrorKind::UnknownPos,
+			"Connection data lost since last time".into(),
+			http::StatusCode::BAD_REQUEST,
+		));
+	}
+
 	if globalsince == 0 {
-		if let Some(conn_id) = &body.conn_id {
-			services
-				.users
-				.forget_sync_request_connection(sender_user.clone(), sender_device.clone(), conn_id.clone());
-		}
+		services
+			.users
+			.forget_sync_request_connection(sender_user.clone(), sender_device.clone(), conn_id.clone());
 	}
 
 	// Get sticky parameters from cache
@@ -1114,6 +1145,20 @@ pub(crate) async fn sync_events_v4_route(
 		.filter_map(Result::ok)
 		.collect::<Vec<_>>();
 
+	let all_invited_rooms = services
+		.rooms
+		.state_cache
+		.rooms_invited(&sender_user)
+		.filter_map(Result::ok)
+		.map(|r| r.0)
+		.collect::<Vec<_>>();
+
+	let all_rooms = all_joined_rooms
+		.iter()
+		.cloned()
+		.chain(all_invited_rooms.clone())
+		.collect();
+
 	if body.extensions.to_device.enabled.unwrap_or(false) {
 		services
 			.users
@@ -1123,6 +1168,37 @@ pub(crate) async fn sync_events_v4_route(
 	let mut left_encrypted_users = HashSet::new(); // Users that have left any encrypted rooms the sender was in
 	let mut device_list_changes = HashSet::new();
 	let mut device_list_left = HashSet::new();
+
+	let mut receipts = sync_events::v4::Receipts {
+		rooms: BTreeMap::new(),
+	};
+
+	let mut account_data = sync_events::v4::AccountData {
+		global: Vec::new(),
+		rooms: BTreeMap::new(),
+	};
+	if body.extensions.account_data.enabled.unwrap_or(false) {
+		account_data.global = services
+			.account_data
+			.changes_since(None, &sender_user, globalsince)?
+			.into_iter()
+			.filter_map(|e| extract_variant!(e, AnyRawAccountDataEvent::Global))
+			.collect();
+
+		if let Some(rooms) = body.extensions.account_data.rooms {
+			for room in rooms {
+				account_data.rooms.insert(
+					room.clone(),
+					services
+						.account_data
+						.changes_since(Some(&room), &sender_user, globalsince)?
+						.into_iter()
+						.filter_map(|e| extract_variant!(e, AnyRawAccountDataEvent::Room))
+						.collect(),
+				);
+			}
+		}
+	}
 
 	if body.extensions.e2ee.enabled.unwrap_or(false) {
 		// Look for device list updates of this account
@@ -1288,9 +1364,23 @@ pub(crate) async fn sync_events_v4_route(
 	let mut todo_rooms = BTreeMap::new(); // and required state
 
 	for (list_id, list) in body.lists {
-		if list.filters.and_then(|f| f.is_invite).unwrap_or(false) {
-			continue;
-		}
+		let active_rooms = match list.filters.clone().and_then(|f| f.is_invite) {
+			Some(true) => &all_invited_rooms,
+			Some(false) => &all_joined_rooms,
+			None => &all_rooms,
+		};
+
+		let active_rooms = match list.filters.clone().map(|f| f.not_room_types) {
+			Some(filter) if filter.is_empty() => active_rooms.clone(),
+			Some(value) => filter_rooms(active_rooms, State(services), &value, true),
+			None => active_rooms.clone(),
+		};
+
+		let active_rooms = match list.filters.clone().map(|f| f.room_types) {
+			Some(filter) if filter.is_empty() => active_rooms.clone(),
+			Some(value) => filter_rooms(&active_rooms, State(services), &value, false),
+			None => active_rooms,
+		};
 
 		let mut new_known_rooms = BTreeSet::new();
 
@@ -1303,13 +1393,15 @@ pub(crate) async fn sync_events_v4_route(
 					.map(|mut r| {
 						r.0 = r.0.clamp(
 							uint!(0),
-							UInt::try_from(all_joined_rooms.len().saturating_sub(1)).unwrap_or(UInt::MAX),
+							UInt::try_from(active_rooms.len().saturating_sub(1)).unwrap_or(UInt::MAX),
 						);
-						r.1 = r.1.clamp(
-							r.0,
-							UInt::try_from(all_joined_rooms.len().saturating_sub(1)).unwrap_or(UInt::MAX),
-						);
-						let room_ids = all_joined_rooms[usize_from_ruma(r.0)..=usize_from_ruma(r.1)].to_vec();
+						r.1 =
+							r.1.clamp(r.0, UInt::try_from(active_rooms.len().saturating_sub(1)).unwrap_or(UInt::MAX));
+						let room_ids = if !active_rooms.is_empty() {
+							active_rooms[usize_from_ruma(r.0)..=usize_from_ruma(r.1)].to_vec()
+						} else {
+							Vec::new()
+						};
 						new_known_rooms.extend(room_ids.iter().cloned());
 						for room_id in &room_ids {
 							let todo_room = todo_rooms
@@ -1342,7 +1434,7 @@ pub(crate) async fn sync_events_v4_route(
 						}
 					})
 					.collect(),
-				count: ruma_from_usize(all_joined_rooms.len()),
+				count: ruma_from_usize(active_rooms.len()),
 			},
 		);
 
@@ -1412,7 +1504,31 @@ pub(crate) async fn sync_events_v4_route(
 		let (timeline_pdus, limited) =
 			load_timeline(&services, &sender_user, room_id, roomsincecount, *timeline_limit)?;
 
-		if roomsince != &0 && timeline_pdus.is_empty() {
+		account_data.rooms.insert(
+			room_id.clone(),
+			services
+				.account_data
+				.changes_since(Some(room_id), &sender_user, *roomsince)?
+				.into_iter()
+				.filter_map(|e| extract_variant!(e, AnyRawAccountDataEvent::Room))
+				.collect(),
+		);
+
+		let room_receipts = services
+			.rooms
+			.read_receipt
+			.readreceipts_since(room_id, *roomsince);
+		let vector: Vec<_> = room_receipts.into_iter().collect();
+		let receipt_size = vector.len();
+		receipts
+			.rooms
+			.insert(room_id.clone(), pack_receipts(Box::new(vector.into_iter())));
+
+		if roomsince != &0
+			&& timeline_pdus.is_empty()
+			&& account_data.rooms.get(room_id).is_some_and(Vec::is_empty)
+			&& receipt_size == 0
+		{
 			continue;
 		}
 
@@ -1440,6 +1556,24 @@ pub(crate) async fn sync_events_v4_route(
 			.map(|(_, pdu)| pdu.to_sync_room_event())
 			.collect();
 
+		let invite_state = if all_invited_rooms.contains(room_id) {
+			services
+				.rooms
+				.state_cache
+				.invite_state(&sender_user, room_id)
+				.unwrap_or(None)
+		} else {
+			None
+		};
+
+		let mut timestamp: Option<_> = None;
+		for (_, pdu) in timeline_pdus {
+			let ts = MilliSecondsSinceUnixEpoch(pdu.origin_server_ts);
+			if DEFAULT_BUMP_TYPES.contains(pdu.event_type()) && !timestamp.is_some_and(|time| time > ts) {
+				timestamp = Some(ts);
+			}
+		}
+
 		let required_state = required_state_request
 			.iter()
 			.map(|state| {
@@ -1466,13 +1600,10 @@ pub(crate) async fn sync_events_v4_route(
 						.rooms
 						.state_accessor
 						.get_member(room_id, &member)?
-						.map(|memberevent| {
-							(
-								memberevent
-									.displayname
-									.unwrap_or_else(|| member.to_string()),
-								memberevent.avatar_url,
-							)
+						.map(|memberevent| SlidingSyncRoomHero {
+							user_id: member,
+							name: memberevent.displayname,
+							avatar: memberevent.avatar_url,
 						}),
 				)
 			})
@@ -1484,18 +1615,26 @@ pub(crate) async fn sync_events_v4_route(
 			Ordering::Greater => {
 				let firsts = heroes[1..]
 					.iter()
-					.map(|h| h.0.clone())
+					.map(|h| h.name.clone().unwrap_or_else(|| h.user_id.to_string()))
 					.collect::<Vec<_>>()
 					.join(", ");
-				let last = heroes[0].0.clone();
+				let last = heroes[0]
+					.name
+					.clone()
+					.unwrap_or_else(|| heroes[0].user_id.to_string());
 				Some(format!("{firsts} and {last}"))
 			},
-			Ordering::Equal => Some(heroes[0].0.clone()),
+			Ordering::Equal => Some(
+				heroes[0]
+					.name
+					.clone()
+					.unwrap_or_else(|| heroes[0].user_id.to_string()),
+			),
 			Ordering::Less => None,
 		};
 
 		let heroes_avatar = if heroes.len() == 1 {
-			heroes[0].1.clone()
+			heroes[0].avatar.clone()
 		} else {
 			None
 		};
@@ -1515,7 +1654,7 @@ pub(crate) async fn sync_events_v4_route(
 				},
 				initial: Some(roomsince == &0),
 				is_dm: None,
-				invite_state: None,
+				invite_state,
 				unread_notifications: UnreadNotificationsCount {
 					highlight_count: Some(
 						services
@@ -1557,8 +1696,8 @@ pub(crate) async fn sync_events_v4_route(
 						.unwrap_or_else(|_| uint!(0)),
 				),
 				num_live: None, // Count events in timeline greater than global sync counter
-				timestamp: None,
-				heroes: None,
+				timestamp,
+				heroes: Some(heroes),
 			},
 		);
 	}
@@ -1602,30 +1741,44 @@ pub(crate) async fn sync_events_v4_route(
 				// Fallback keys are not yet supported
 				device_unused_fallback_key_types: None,
 			},
-			account_data: sync_events::v4::AccountData {
-				global: if body.extensions.account_data.enabled.unwrap_or(false) {
-					services
-						.account_data
-						.changes_since(None, &sender_user, globalsince)?
-						.into_iter()
-						.filter_map(|(_, v)| {
-							serde_json::from_str(v.json().get())
-								.map_err(|_| Error::bad_database("Invalid account event in database."))
-								.ok()
-						})
-						.collect()
-				} else {
-					Vec::new()
-				},
-				rooms: BTreeMap::new(),
-			},
-			receipts: sync_events::v4::Receipts {
-				rooms: BTreeMap::new(),
-			},
+			account_data,
+			receipts,
 			typing: sync_events::v4::Typing {
 				rooms: BTreeMap::new(),
 			},
 		},
 		delta_token: None,
 	})
+}
+
+fn filter_rooms(
+	rooms: &[OwnedRoomId], State(services): State<crate::State>, filter: &[Option<RoomType>], negate: bool,
+) -> Vec<OwnedRoomId> {
+	return rooms
+		.iter()
+		.filter(|r| {
+			match services.rooms.state_accessor.get_room_type(r) {
+				Err(e) => {
+					warn!("Requested room type for {}, but could not retrieve with error {}", r, e);
+					false
+				},
+				Ok(None) => {
+					// For rooms which do not have a room type, use 'null' to include them
+					if negate {
+						!filter.contains(&None)
+					} else {
+						filter.contains(&None)
+					}
+				},
+				Ok(Some(room_type)) => {
+					if negate {
+						!filter.contains(&Some(room_type))
+					} else {
+						filter.is_empty() || filter.contains(&Some(room_type))
+					}
+				},
+			}
+		})
+		.cloned()
+		.collect();
 }

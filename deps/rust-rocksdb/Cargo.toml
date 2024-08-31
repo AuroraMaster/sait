@@ -26,8 +26,8 @@ serde1 = ["rust-rocksdb/serde1"]
 malloc-usable-size = ["rust-rocksdb/malloc-usable-size"]
 
 [dependencies.rust-rocksdb]
-git = "https://github.com/zaidoon1/rust-rocksdb"
-rev = "4056a3b0f823013fec49f6d0b3e5698856e6476a"
+git = "https://github.com/girlbossceo/rust-rocksdb-zaidoon1"
+rev = "5383ca8173299066b516406e3a2cf945ead891cb"
 #branch = "master"
 default-features = false
 

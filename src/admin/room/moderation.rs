@@ -60,7 +60,12 @@ pub(crate) enum RoomModerationCommand {
 	},
 
 	/// - List of all rooms we have banned
-	ListBannedRooms,
+	ListBannedRooms {
+		#[arg(long)]
+		/// Whether to only output room IDs without supplementary room
+		/// information
+		no_details: bool,
+	},
 }
 
 #[admin_command]
@@ -207,6 +212,25 @@ async fn ban_room(
 			}
 		}
 	}
+
+	// remove any local aliases, ignore errors
+	for ref local_alias in self
+		.services
+		.rooms
+		.alias
+		.local_aliases_for_room(&room_id)
+		.filter_map(Result::ok)
+	{
+		_ = self
+			.services
+			.rooms
+			.alias
+			.remove_alias(local_alias, &self.services.globals.server_user)
+			.await;
+	}
+
+	// unpublish from room directory, ignore errors
+	_ = self.services.rooms.directory.set_not_public(&room_id);
 
 	if disable_federation {
 		self.services.rooms.metadata.disable_room(&room_id, true)?;
@@ -428,6 +452,25 @@ async fn ban_list_of_rooms(&self, force: bool, disable_federation: bool) -> Resu
 			}
 		}
 
+		// remove any local aliases, ignore errors
+		for ref local_alias in self
+			.services
+			.rooms
+			.alias
+			.local_aliases_for_room(&room_id)
+			.filter_map(Result::ok)
+		{
+			_ = self
+				.services
+				.rooms
+				.alias
+				.remove_alias(local_alias, &self.services.globals.server_user)
+				.await;
+		}
+
+		// unpublish from room directory, ignore errors
+		_ = self.services.rooms.directory.set_not_public(&room_id);
+
 		if disable_federation {
 			self.services.rooms.metadata.disable_room(&room_id, true)?;
 		}
@@ -525,7 +568,7 @@ async fn unban_room(&self, enable_federation: bool, room: Box<RoomOrAliasId>) ->
 }
 
 #[admin_command]
-async fn list_banned_rooms(&self) -> Result<RoomMessageEventContent> {
+async fn list_banned_rooms(&self, no_details: bool) -> Result<RoomMessageEventContent> {
 	let rooms = self
 		.services
 		.rooms
@@ -551,7 +594,11 @@ async fn list_banned_rooms(&self) -> Result<RoomMessageEventContent> {
 				rooms.len(),
 				rooms
 					.iter()
-					.map(|(id, members, name)| format!("{id}\tMembers: {members}\tName: {name}"))
+					.map(|(id, members, name)| if no_details {
+						format!("{id}")
+					} else {
+						format!("{id}\tMembers: {members}\tName: {name}")
+					})
 					.collect::<Vec<_>>()
 					.join("\n")
 			);
@@ -559,7 +606,7 @@ async fn list_banned_rooms(&self) -> Result<RoomMessageEventContent> {
 			Ok(RoomMessageEventContent::notice_markdown(output_plain))
 		},
 		Err(e) => {
-			error!("Failed to list banned rooms: {}", e);
+			error!("Failed to list banned rooms: {e}");
 			Ok(RoomMessageEventContent::text_plain(format!("Unable to list banned rooms: {e}")))
 		},
 	}

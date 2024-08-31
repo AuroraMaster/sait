@@ -24,6 +24,14 @@ pub(crate) struct Args {
 	/// Activate admin command console automatically after startup.
 	#[arg(long, num_args(0))]
 	pub(crate) console: bool,
+
+	/// Execute console command automatically after startup.
+	#[arg(long)]
+	pub(crate) execute: Vec<String>,
+
+	/// Set functional testing modes if available. Ex '--test=smoke'
+	#[arg(long, hide(true))]
+	pub(crate) test: Vec<String>,
 }
 
 /// Parse commandline arguments into structured data
@@ -38,6 +46,12 @@ pub(crate) fn update(mut config: Figment, args: &Args) -> Result<Figment> {
 	if args.console {
 		config = config.join(("admin_console_automatic", true));
 	}
+
+	// Execute commands after any commands listed in configuration file
+	config = config.adjoin(("admin_execute", &args.execute));
+
+	// Update config with names of any functional-tests
+	config = config.adjoin(("test", &args.test));
 
 	// All other individual overrides can go last in case we have options which
 	// set multiple conf items at once and the user still needs granular overrides.

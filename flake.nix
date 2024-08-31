@@ -9,14 +9,17 @@
     flake-utils.url = "github:numtide/flake-utils?ref=main";
     nix-filter.url = "github:numtide/nix-filter?ref=main";
     nixpkgs.url = "github:NixOS/nixpkgs?ref=nixos-unstable";
-    rocksdb = { url = "github:girlbossceo/rocksdb?ref=v9.4.0"; flake = false; };
+    rocksdb = { url = "github:girlbossceo/rocksdb?ref=v9.5.2"; flake = false; };
     liburing = { url = "github:axboe/liburing?ref=master"; flake = false; };
   };
 
   outputs = inputs:
     inputs.flake-utils.lib.eachDefaultSystem (system:
     let
-      pkgsHost = inputs.nixpkgs.legacyPackages.${system};
+      pkgsHost = import inputs.nixpkgs{
+        inherit system;
+        config.permittedInsecurePackages = [ "olm-3.2.16" ];
+      };
       pkgsHostStatic = pkgsHost.pkgsStatic;
 
       # The Rust toolchain to use
@@ -24,14 +27,14 @@
         file = ./rust-toolchain.toml;
 
         # See also `rust-toolchain.toml`
-        sha256 = "sha256-6eN/GKzjVSjEhGO9FhWObkRFaE1Jf+uqMSdQnb8lcB4=";
+        sha256 = "sha256-3jVIIf5XPnUU1CRaTyAiO0XHVbJl12MSx3eucTXCjtE=";
       };
 
       mkScope = pkgs: pkgs.lib.makeScope pkgs.newScope (self: {
         inherit pkgs;
         book = self.callPackage ./nix/pkgs/book {};
         complement = self.callPackage ./nix/pkgs/complement {};
-        craneLib = ((inputs.crane.mkLib pkgs).overrideToolchain toolchain);
+        craneLib = ((inputs.crane.mkLib pkgs).overrideToolchain (_: toolchain));
         inherit inputs;
         main = self.callPackage ./nix/pkgs/main {};
         oci-image = self.callPackage ./nix/pkgs/oci-image {};

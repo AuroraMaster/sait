@@ -48,9 +48,6 @@ default = [
 	"zstd_compression",
 ]
 
-axum_dual_protocol = [
-	"conduit-router/axum_dual_protocol",
-]
 brotli_compression = [
 	"conduit-api/brotli_compression",
 	"conduit-core/brotli_compression",
@@ -89,6 +86,9 @@ jemalloc = [
 ]
 jemalloc_prof = [
 	"conduit-core/jemalloc_prof",
+]
+jemalloc_stats = [
+	"conduit-core/jemalloc_stats",
 ]
 perf_measurements = [
 	"dep:opentelemetry",
@@ -129,6 +129,7 @@ tokio_console = [
 	"tokio/tracing",
 ]
 zstd_compression = [
+    "conduit-api/zstd_compression",
 	"conduit-core/zstd_compression",
 	"conduit-database/zstd_compression",
 	"conduit-router/zstd_compression",

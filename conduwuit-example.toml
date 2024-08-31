@@ -224,9 +224,11 @@ registration_token = "change this token for something specific to your server"
 # No default.
 # forbidden_alias_names = []
 
-# List of forbidden server names that we will block all client room joins, incoming federated room directory requests, incoming federated invites for, and incoming federated joins. This check is applied on the room ID, room alias, sender server name, and sender user's server name.
-# Basically "global" ACLs. For our user (client) checks, admin users are allowed.
-# No default.
+# List of forbidden server names that we will block incoming AND outgoing federation with, and block client room joins / remote user invites.
+#
+# This check is applied on the room ID, room alias, sender server name, sender user's server name, inbound federation X-Matrix origin, and outbound federation handler.
+#
+# Basically "global" ACLs. No default.
 # forbidden_remote_server_names = []
 
 # List of forbidden server names that we will block all outgoing federated room directory requests for. Useful for preventing our users from wandering into bad servers or spaces.
@@ -388,10 +390,21 @@ allow_profile_lookup_federation_requests = true
 
 # Enable backward-compatibility with Conduit's media directory by creating symlinks of media. This
 # option is only necessary if you plan on using Conduit again. Otherwise setting this to false
-# reduces filesystem clutter and overhead for managing these symlinks in the directory.
+# reduces filesystem clutter and overhead for managing these symlinks in the directory. This is now
+# disabled by default. You may still return to upstream Conduit but you have to run Conduwuit at
+# least once with this set to true and allow the media_startup_check to take place before shutting
+# down to return to Conduit.
 #
-# Enabled by default.
-#media_compat_file_link = true
+# Disabled by default.
+#media_compat_file_link = false
+
+# Prunes missing media from the database as part of the media startup checks. This means if you
+# delete files from the media directory the corresponding entries will be removed from the
+# database. This is disabled by default because if the media directory is accidentally moved or
+# inaccessible the metadata entries in the database will be lost with sadness.
+#
+# Disabled by default.
+#prune_missing_media = false
 
 # Checks consistency of the media directory at startup:
 # 1. When `media_compat_file_link` is enbled, this check will upgrade media when switching back

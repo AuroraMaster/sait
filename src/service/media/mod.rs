@@ -1,5 +1,7 @@
 mod data;
+pub(super) mod migrations;
 mod preview;
+mod remote;
 mod tests;
 mod thumbnail;
 
@@ -7,26 +9,31 @@ use std::{path::PathBuf, sync::Arc, time::SystemTime};
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
-use conduit::{debug, debug_error, err, error, trace, utils, utils::MutexMap, Err, Result, Server};
-use data::{Data, Metadata};
-use ruma::{OwnedMxcUri, OwnedUserId};
+use conduit::{
+	debug, debug_error, debug_info, err, error, trace,
+	utils::{self, MutexMap},
+	warn, Err, Result, Server,
+};
+use ruma::{http_headers::ContentDisposition, Mxc, OwnedMxcUri, UserId};
 use tokio::{
 	fs,
 	io::{AsyncReadExt, AsyncWriteExt, BufReader},
 };
 
-use crate::{client, globals, Dep};
+use self::data::{Data, Metadata};
+pub use self::thumbnail::Dim;
+use crate::{client, globals, sending, Dep};
 
 #[derive(Debug)]
 pub struct FileMeta {
 	pub content: Option<Vec<u8>>,
 	pub content_type: Option<String>,
-	pub content_disposition: Option<String>,
+	pub content_disposition: Option<ContentDisposition>,
 }
 
 pub struct Service {
 	url_preview_mutex: MutexMap<String, ()>,
-	pub(crate) db: Data,
+	pub(super) db: Data,
 	services: Services,
 }
 
@@ -34,10 +41,17 @@ struct Services {
 	server: Arc<Server>,
 	client: Dep<client::Service>,
 	globals: Dep<globals::Service>,
+	sending: Dep<sending::Service>,
 }
 
 /// generated MXC ID (`media-id`) length
 pub const MXC_LENGTH: usize = 32;
+
+/// Cache control for immutable objects.
+pub const CACHE_CONTROL_IMMUTABLE: &str = "public,max-age=31536000,immutable";
+
+/// Default cross-origin resource policy.
+pub const CORP_CROSS_ORIGIN: &str = "cross-origin";
 
 #[async_trait]
 impl crate::Service for Service {
@@ -49,6 +63,7 @@ impl crate::Service for Service {
 				server: args.server.clone(),
 				client: args.depend::<client::Service>("client"),
 				globals: args.depend::<globals::Service>("globals"),
+				sending: args.depend::<sending::Service>("sending"),
 			},
 		}))
 	}
@@ -65,17 +80,13 @@ impl crate::Service for Service {
 impl Service {
 	/// Uploads a file.
 	pub async fn create(
-		&self, sender_user: Option<OwnedUserId>, mxc: &str, content_disposition: Option<&str>,
+		&self, mxc: &Mxc<'_>, user: Option<&UserId>, content_disposition: Option<&ContentDisposition>,
 		content_type: Option<&str>, file: &[u8],
 	) -> Result<()> {
 		// Width, Height = 0 if it's not a thumbnail
-		let key = if let Some(user) = sender_user {
-			self.db
-				.create_file_metadata(Some(user.as_str()), mxc, 0, 0, content_disposition, content_type)?
-		} else {
-			self.db
-				.create_file_metadata(None, mxc, 0, 0, content_disposition, content_type)?
-		};
+		let key = self
+			.db
+			.create_file_metadata(mxc, user, &Dim::default(), content_disposition, content_type)?;
 
 		//TODO: Dangling metadata in database if creation fails
 		let mut f = self.create_media_file(&key).await?;
@@ -85,7 +96,7 @@ impl Service {
 	}
 
 	/// Deletes a file in the database and from the media directory via an MXC
-	pub async fn delete(&self, mxc: &str) -> Result<()> {
+	pub async fn delete(&self, mxc: &Mxc<'_>) -> Result<()> {
 		if let Ok(keys) = self.db.search_mxc_metadata_prefix(mxc) {
 			for key in keys {
 				trace!(?mxc, ?key, "Deleting from filesystem");
@@ -107,13 +118,38 @@ impl Service {
 		}
 	}
 
+	/// Deletes all media by the specified user
+	///
+	/// currently, this is only practical for local users
+	pub async fn delete_from_user(&self, user: &UserId, force: bool) -> Result<usize> {
+		let mxcs = self.db.get_all_user_mxcs(user);
+		let mut deletion_count: usize = 0;
+
+		for mxc in mxcs {
+			let mxc: Mxc<'_> = mxc.as_str().try_into()?;
+			debug_info!("Deleting MXC {mxc} by user {user} from database and filesystem");
+			if force {
+				_ = self
+					.delete(&mxc)
+					.await
+					.inspect_err(|e| warn!("Failed to delete {mxc} from user {user}, ignoring error: {e}"));
+			} else {
+				self.delete(&mxc).await?;
+			}
+
+			deletion_count = deletion_count.saturating_add(1);
+		}
+
+		Ok(deletion_count)
+	}
+
 	/// Downloads a file.
-	pub async fn get(&self, mxc: &str) -> Result<Option<FileMeta>> {
+	pub async fn get(&self, mxc: &Mxc<'_>) -> Result<Option<FileMeta>> {
 		if let Ok(Metadata {
 			content_disposition,
 			content_type,
 			key,
-		}) = self.db.search_file_metadata(mxc, 0, 0)
+		}) = self.db.search_file_metadata(mxc, &Dim::default())
 		{
 			let mut content = Vec::new();
 			let path = self.get_media_file(&key);
@@ -131,22 +167,14 @@ impl Service {
 		}
 	}
 
-	/// Deletes all remote only media files in the given at or after
-	/// time/duration. Returns a u32 with the amount of media files deleted.
-	pub async fn delete_all_remote_media_at_after_time(&self, time: String, force: bool) -> Result<usize> {
+	/// Gets all the MXC URIs in our media database
+	pub async fn get_all_mxcs(&self) -> Result<Vec<OwnedMxcUri>> {
 		let all_keys = self.db.get_all_media_keys();
 
-		let user_duration: SystemTime = match cyborgtime::parse_duration(&time) {
-			Err(e) => return Err!(Database(error!("Failed to parse specified time duration: {e}"))),
-			Ok(duration) => SystemTime::now()
-				.checked_sub(duration)
-				.ok_or(err!(Arithmetic("Duration {duration:?} is too large")))?,
-		};
-
-		let mut remote_mxcs: Vec<String> = vec![];
+		let mut mxcs = Vec::with_capacity(all_keys.len());
 
 		for key in all_keys {
-			debug!("Full MXC key from database: {key:?}");
+			trace!("Full MXC key from database: {key:?}");
 
 			// we need to get the MXC URL from the first part of the key (the first 0xff /
 			// 255 push). this is all necessary because of conduit using magic keys for
@@ -164,7 +192,42 @@ impl Service {
 				return Err!(Database("Parsed MXC URL unicode bytes from database but still is None"));
 			};
 
-			debug!("Parsed MXC key to URL: {mxc_s}");
+			trace!("Parsed MXC key to URL: {mxc_s}");
+			let mxc = OwnedMxcUri::from(mxc_s);
+
+			mxcs.push(mxc);
+		}
+
+		Ok(mxcs)
+	}
+
+	/// Deletes all remote only media files in the given at or after
+	/// time/duration. Returns a u32 with the amount of media files deleted.
+	pub async fn delete_all_remote_media_at_after_time(&self, time: SystemTime, force: bool) -> Result<usize> {
+		let all_keys = self.db.get_all_media_keys();
+
+		let mut remote_mxcs = Vec::with_capacity(all_keys.len());
+
+		for key in all_keys {
+			trace!("Full MXC key from database: {key:?}");
+
+			// we need to get the MXC URL from the first part of the key (the first 0xff /
+			// 255 push). this is all necessary because of conduit using magic keys for
+			// media
+			let mut parts = key.split(|&b| b == 0xFF);
+			let mxc = parts
+				.next()
+				.map(|bytes| {
+					utils::string_from_bytes(bytes)
+						.map_err(|e| err!(Database(error!("Failed to parse MXC unicode bytes from our database: {e}"))))
+				})
+				.transpose()?;
+
+			let Some(mxc_s) = mxc else {
+				return Err!(Database("Parsed MXC URL unicode bytes from database but still is None"));
+			};
+
+			trace!("Parsed MXC key to URL: {mxc_s}");
 			let mxc = OwnedMxcUri::from(mxc_s);
 			if mxc.server_name() == Ok(self.services.globals.server_name()) {
 				debug!("Ignoring local media MXC: {mxc}");
@@ -175,7 +238,20 @@ impl Service {
 			let path = self.get_media_file(&key);
 			debug!("MXC path: {path:?}");
 
-			let file_metadata = fs::metadata(path.clone()).await?;
+			let file_metadata = match fs::metadata(path.clone()).await {
+				Ok(file_metadata) => file_metadata,
+				Err(e) => {
+					if force {
+						error!("Failed to obtain file metadata for MXC {mxc} at file path \"{path:?}\", skipping: {e}");
+						continue;
+					}
+
+					return Err!(Database(
+						"Failed to obtain file metadata for MXC {mxc} at file path \"{path:?}\": {e}"
+					));
+				},
+			};
+
 			debug!("File metadata: {file_metadata:?}");
 
 			let file_created_at = match file_metadata.created() {
@@ -186,15 +262,16 @@ impl Service {
 				},
 				Err(err) => {
 					if force {
-						error!("Could not delete MXC path {path:?}: {err:?}. Skipping...");
+						error!("Could not delete MXC {mxc} at path {path:?}: {err:?}. Skipping...");
 						continue;
 					}
+
 					return Err(err.into());
 				},
 			};
 
 			debug!("File created at: {file_created_at:?}");
-			if file_created_at <= user_duration {
+			if file_created_at <= time {
 				debug!("File is within user duration, pushing to list of file paths and keys to delete.");
 				remote_mxcs.push(mxc.to_string());
 			}
@@ -207,12 +284,25 @@ impl Service {
 			return Err!(Database("Did not found any eligible MXCs to delete."));
 		}
 
-		debug!("Deleting media now in the past {user_duration:?}.");
+		debug_info!("Deleting media now in the past {time:?}.");
 		let mut deletion_count: usize = 0;
 		for mxc in remote_mxcs {
-			debug!("Deleting MXC {mxc} from database and filesystem");
-			self.delete(&mxc).await?;
-			deletion_count = deletion_count.saturating_add(1);
+			let mxc: Mxc<'_> = mxc.as_str().try_into()?;
+			debug_info!("Deleting MXC {mxc} from database and filesystem");
+
+			match self.delete(&mxc).await {
+				Ok(()) => {
+					deletion_count = deletion_count.saturating_add(1);
+				},
+				Err(e) => {
+					if force {
+						warn!("Failed to delete {mxc}, ignoring error and skipping: {e}");
+						continue;
+					}
+
+					return Err!(Database(warn!("Failed to delete MXC {mxc}: {e}")));
+				},
+			}
 		}
 
 		Ok(deletion_count)
@@ -256,6 +346,18 @@ impl Service {
 		}
 
 		Ok(file)
+	}
+
+	#[inline]
+	pub fn get_metadata(&self, mxc: &Mxc<'_>) -> Option<FileMeta> {
+		self.db
+			.search_file_metadata(mxc, &Dim::default())
+			.map(|metadata| FileMeta {
+				content_disposition: metadata.content_disposition,
+				content_type: metadata.content_type,
+				content: None,
+			})
+			.ok()
 	}
 
 	#[inline]

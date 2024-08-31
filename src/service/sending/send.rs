@@ -1,7 +1,8 @@
 use std::{fmt::Debug, mem};
 
 use conduit::{
-	debug, debug_error, debug_warn, err, error::inspect_debug_log, trace, utils::string::EMPTY, Err, Error, Result,
+	debug, debug_error, debug_info, debug_warn, err, error::inspect_debug_log, trace, utils::string::EMPTY, Err, Error,
+	Result,
 };
 use http::{header::AUTHORIZATION, HeaderValue};
 use ipaddress::IPAddress;
@@ -31,6 +32,16 @@ impl super::Service {
 			return Err!(Config("allow_federation", "Federation is disabled."));
 		}
 
+		if self
+			.server
+			.config
+			.forbidden_remote_server_names
+			.contains(&dest.to_owned())
+		{
+			debug_info!("Refusing to send outbound federation request to {dest}");
+			return Err!(Request(Forbidden("Federation with this homeserver is not allowed.")));
+		}
+
 		let actual = self.services.resolver.get_actual_dest(dest).await?;
 		let request = self.prepare::<T>(dest, &actual, req).await?;
 		self.execute::<T>(dest, &actual, request, client).await
@@ -56,7 +67,7 @@ impl super::Service {
 	where
 		T: OutgoingRequest + Debug + Send,
 	{
-		const VERSIONS: [MatrixVersion; 1] = [MatrixVersion::V1_5];
+		const VERSIONS: [MatrixVersion; 1] = [MatrixVersion::V1_11];
 		const SATIR: SendAccessToken<'_> = SendAccessToken::IfRequired(EMPTY);
 
 		trace!("Preparing request");

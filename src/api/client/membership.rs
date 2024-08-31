@@ -403,6 +403,7 @@ pub(crate) async fn kick_user_route(
 				unsigned: None,
 				state_key: Some(body.user_id.to_string()),
 				redacts: None,
+				timestamp: None,
 			},
 			sender_user,
 			&body.room_id,
@@ -465,6 +466,7 @@ pub(crate) async fn ban_user_route(
 				unsigned: None,
 				state_key: Some(body.user_id.to_string()),
 				redacts: None,
+				timestamp: None,
 			},
 			sender_user,
 			&body.room_id,
@@ -512,6 +514,7 @@ pub(crate) async fn unban_user_route(
 				unsigned: None,
 				state_key: Some(body.user_id.to_string()),
 				redacts: None,
+				timestamp: None,
 			},
 			sender_user,
 			&body.room_id,
@@ -662,6 +665,12 @@ pub async fn join_room_by_id_helper(
 ) -> Result<join_room_by_id::v3::Response> {
 	let state_lock = services.rooms.state.mutex.lock(room_id).await;
 
+	let user_is_guest = services.users.is_deactivated(sender_user).unwrap_or(false);
+
+	if matches!(services.rooms.state_accessor.guest_can_join(room_id), Ok(false)) && user_is_guest {
+		return Err!(Request(Forbidden("Guests are not allowed to join this room")));
+	}
+
 	if matches!(services.rooms.state_cache.is_joined(sender_user, room_id), Ok(true)) {
 		debug_warn!("{sender_user} is already joined in {room_id}");
 		return Ok(join_room_by_id::v3::Response {
@@ -810,7 +819,7 @@ async fn join_room_by_id_helper_remote(
 			},
 			// only room versions 8 and above using `join_authorized_via_users_server` (restricted joins) need to
 			// validate and send signatures
-			V8 | V9 | V10 | V11 => {
+			_ => {
 				if let Some(signed_raw) = &send_join_response.room_state.event {
 					info!(
 						"There is a signed event. This room is probably using restricted joins. Adding signature to \
@@ -858,16 +867,6 @@ async fn join_room_by_id_helper_remote(
 						},
 					}
 				}
-			},
-			_ => {
-				warn!(
-					"Unexpected or unsupported room version {} for room {}",
-					&room_version_id, room_id
-				);
-				return Err(Error::BadRequest(
-					ErrorKind::BadJson,
-					"Unexpected or unsupported room version found",
-				));
 			},
 		}
 	}
@@ -1094,6 +1093,7 @@ async fn join_room_by_id_helper_local(
 				unsigned: None,
 				state_key: Some(sender_user.to_string()),
 				redacts: None,
+				timestamp: None,
 			},
 			sender_user,
 			room_id,
@@ -1406,6 +1406,7 @@ pub(crate) async fn invite_helper(
 					unsigned: None,
 					state_key: Some(user_id.to_string()),
 					redacts: None,
+					timestamp: None,
 				},
 				sender_user,
 				room_id,
@@ -1517,6 +1518,7 @@ pub(crate) async fn invite_helper(
 				unsigned: None,
 				state_key: Some(user_id.to_string()),
 				redacts: None,
+				timestamp: None,
 			},
 			sender_user,
 			room_id,
@@ -1634,6 +1636,7 @@ pub async fn leave_room(services: &Services, user_id: &UserId, room_id: &RoomId,
 					unsigned: None,
 					state_key: Some(user_id.to_string()),
 					redacts: None,
+					timestamp: None,
 				},
 				user_id,
 				room_id,

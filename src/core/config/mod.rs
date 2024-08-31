@@ -1,5 +1,5 @@
 use std::{
-	collections::BTreeMap,
+	collections::{BTreeMap, BTreeSet},
 	fmt,
 	net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
 	path::PathBuf,
@@ -143,6 +143,8 @@ pub struct Config {
 	pub allow_encryption: bool,
 	#[serde(default = "true_fn")]
 	pub allow_federation: bool,
+	#[serde(default)]
+	pub federation_loopback: bool,
 	#[serde(default)]
 	pub allow_public_room_directory_over_federation: bool,
 	#[serde(default)]
@@ -288,9 +290,15 @@ pub struct Config {
 	pub allow_guests_auto_join_rooms: bool,
 
 	#[serde(default = "true_fn")]
+	pub allow_legacy_media: bool,
+	#[serde(default = "true_fn")]
+	pub freeze_legacy_media: bool,
+	#[serde(default = "true_fn")]
 	pub media_startup_check: bool,
 	#[serde(default)]
 	pub media_compat_file_link: bool,
+	#[serde(default)]
+	pub prune_missing_media: bool,
 	#[serde(default = "Vec::new")]
 	pub prevent_media_downloads_from: Vec<OwnedServerName>,
 
@@ -334,6 +342,14 @@ pub struct Config {
 	pub admin_escape_commands: bool,
 	#[serde(default)]
 	pub admin_console_automatic: bool,
+	#[serde(default)]
+	pub admin_execute: Vec<String>,
+	#[serde(default)]
+	pub admin_execute_errors_ignore: bool,
+	#[serde(default = "default_admin_log_capture")]
+	pub admin_log_capture: String,
+	#[serde(default = "default_admin_room_tag")]
+	pub admin_room_tag: String,
 
 	#[serde(default)]
 	pub sentry: bool,
@@ -355,6 +371,9 @@ pub struct Config {
 	#[serde(default)]
 	pub tokio_console: bool,
 
+	#[serde(default)]
+	pub test: BTreeSet<String>,
+
 	#[serde(flatten)]
 	#[allow(clippy::zero_sized_map_values)] // this is a catchall, the map shouldn't be zero at runtime
 	catchall: BTreeMap<String, IgnoredAny>,
@@ -366,8 +385,6 @@ pub struct TlsConfig {
 	pub key: String,
 	#[serde(default)]
 	/// Whether to listen and allow for HTTP and HTTPS connections (insecure!)
-	/// Only works / does something if the `axum_dual_protocol` feature flag was
-	/// built
 	pub dual_protocol: bool,
 }
 
@@ -563,6 +580,7 @@ impl fmt::Display for Config {
 		line("New user display name suffix", &self.new_user_displayname_suffix);
 		line("Allow encryption", &self.allow_encryption.to_string());
 		line("Allow federation", &self.allow_federation.to_string());
+		line("Federation loopback", &self.federation_loopback.to_string());
 		line(
 			"Allow incoming federated presence requests (updates)",
 			&self.allow_incoming_presence.to_string(),
@@ -592,6 +610,13 @@ impl fmt::Display for Config {
 			"Activate admin console after startup",
 			&self.admin_console_automatic.to_string(),
 		);
+		line("Execute admin commands after startup", &self.admin_execute.join(", "));
+		line(
+			"Continue startup even if some commands fail",
+			&self.admin_execute_errors_ignore.to_string(),
+		);
+		line("Filter for admin command log capture", &self.admin_log_capture);
+		line("Admin room tag", &self.admin_room_tag);
 		line("Allow outgoing federated typing", &self.allow_outgoing_typing.to_string());
 		line("Allow incoming federated typing", &self.allow_incoming_typing.to_string());
 		line(
@@ -723,6 +748,9 @@ impl fmt::Display for Config {
 		line("RocksDB Statistics level", &self.rocksdb_stats_level.to_string());
 		line("Media integrity checks on startup", &self.media_startup_check.to_string());
 		line("Media compatibility filesystem links", &self.media_compat_file_link.to_string());
+		line("Prune missing media from database", &self.prune_missing_media.to_string());
+		line("Allow legacy (unauthenticated) media", &self.allow_legacy_media.to_string());
+		line("Freeze legacy (unauthenticated) media", &self.freeze_legacy_media.to_string());
 		line("Prevent Media Downloads From", {
 			let mut lst = vec![];
 			for domain in &self.prevent_media_downloads_from {
@@ -1050,3 +1078,7 @@ fn default_sentry_traces_sample_rate() -> f32 { 0.15 }
 fn default_sentry_filter() -> String { "info".to_owned() }
 
 fn default_startup_netburst_keep() -> i64 { 50 }
+
+fn default_admin_log_capture() -> String { "debug".to_owned() }
+
+fn default_admin_room_tag() -> String { "m.server_notice".to_owned() }

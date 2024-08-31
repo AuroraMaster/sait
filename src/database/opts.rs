@@ -1,6 +1,6 @@
-use std::{cmp, collections::HashMap};
+use std::{cmp, collections::HashMap, convert::TryFrom};
 
-use conduit::{utils, Config};
+use conduit::{err, utils, Config, Result};
 use rocksdb::{
 	statistics::StatsLevel, BlockBasedOptions, Cache, DBCompactionStyle, DBCompressionType, DBRecoveryMode, Env,
 	LogLevel, Options, UniversalCompactOptions, UniversalCompactionStopStyle,
@@ -11,8 +11,7 @@ use rocksdb::{
 /// resulting value. Note that we require special per-column options on some
 /// columns, therefor columns should only be opened after passing this result
 /// through cf_options().
-pub(crate) fn db_options(config: &Config, env: &mut Env, row_cache: &Cache, col_cache: &Cache) -> Options {
-	const MIN_PARALLELISM: usize = 2;
+pub(crate) fn db_options(config: &Config, env: &mut Env, row_cache: &Cache, col_cache: &Cache) -> Result<Options> {
 	const DEFAULT_STATS_LEVEL: StatsLevel = if cfg!(debug_assertions) {
 		StatsLevel::ExceptDetailedTimers
 	} else {
@@ -25,14 +24,9 @@ pub(crate) fn db_options(config: &Config, env: &mut Env, row_cache: &Cache, col_
 	set_logging_defaults(&mut opts, config);
 
 	// Processing
-	let threads = if config.rocksdb_parallelism_threads == 0 {
-		cmp::max(MIN_PARALLELISM, utils::available_parallelism())
-	} else {
-		cmp::max(MIN_PARALLELISM, config.rocksdb_parallelism_threads)
-	};
-
-	opts.set_max_background_jobs(threads.try_into().unwrap());
-	opts.set_max_subcompactions(threads.try_into().unwrap());
+	opts.set_enable_pipelined_write(true);
+	opts.set_max_background_jobs(num_threads::<i32>(config)?);
+	opts.set_max_subcompactions(num_threads::<u32>(config)?);
 	opts.set_max_file_opening_threads(0);
 	if config.rocksdb_compaction_prio_idle {
 		env.lower_thread_pool_cpu_priority();
@@ -100,13 +94,15 @@ pub(crate) fn db_options(config: &Config, env: &mut Env, row_cache: &Cache, col_
 	});
 
 	opts.set_env(env);
-	opts
+	Ok(opts)
 }
 
 /// Adjust options for the specific column by name. Provide the result of
 /// db_options() as the argument to this function and use the return value in
 /// the arguments to open the specific column.
-pub(crate) fn cf_options(cfg: &Config, name: &str, mut opts: Options, cache: &mut HashMap<String, Cache>) -> Options {
+pub(crate) fn cf_options(
+	cfg: &Config, name: &str, mut opts: Options, cache: &mut HashMap<String, Cache>,
+) -> Result<Options> {
 	// Columns with non-default compaction options
 	match name {
 		"backupid_algorithm"
@@ -129,7 +125,7 @@ pub(crate) fn cf_options(cfg: &Config, name: &str, mut opts: Options, cache: &mu
 			cfg,
 			cache,
 			name,
-			cache_size(cfg, cfg.shorteventid_cache_capacity, 64),
+			cache_size(cfg, cfg.shorteventid_cache_capacity, 64)?,
 		),
 
 		"eventid_shorteventid" => set_table_with_new_cache(
@@ -137,11 +133,17 @@ pub(crate) fn cf_options(cfg: &Config, name: &str, mut opts: Options, cache: &mu
 			cfg,
 			cache,
 			name,
-			cache_size(cfg, cfg.eventidshort_cache_capacity, 64),
+			cache_size(cfg, cfg.eventidshort_cache_capacity, 64)?,
 		),
 
 		"shorteventid_authchain" => {
-			set_table_with_new_cache(&mut opts, cfg, cache, name, cache_size(cfg, cfg.auth_chain_cache_capacity, 192));
+			set_table_with_new_cache(
+				&mut opts,
+				cfg,
+				cache,
+				name,
+				cache_size(cfg, cfg.auth_chain_cache_capacity, 192)?,
+			);
 		},
 
 		"shortstatekey_statekey" => set_table_with_new_cache(
@@ -149,7 +151,7 @@ pub(crate) fn cf_options(cfg: &Config, name: &str, mut opts: Options, cache: &mu
 			cfg,
 			cache,
 			name,
-			cache_size(cfg, cfg.shortstatekey_cache_capacity, 1024),
+			cache_size(cfg, cfg.shortstatekey_cache_capacity, 1024)?,
 		),
 
 		"statekey_shortstatekey" => set_table_with_new_cache(
@@ -157,11 +159,11 @@ pub(crate) fn cf_options(cfg: &Config, name: &str, mut opts: Options, cache: &mu
 			cfg,
 			cache,
 			name,
-			cache_size(cfg, cfg.statekeyshort_cache_capacity, 1024),
+			cache_size(cfg, cfg.statekeyshort_cache_capacity, 1024)?,
 		),
 
 		"eventid_outlierpdu" => {
-			set_table_with_new_cache(&mut opts, cfg, cache, name, cache_size(cfg, cfg.pdu_cache_capacity, 1536));
+			set_table_with_new_cache(&mut opts, cfg, cache, name, cache_size(cfg, cfg.pdu_cache_capacity, 1536)?);
 		},
 
 		"pduid_pdu" => set_table_with_shared_cache(&mut opts, cfg, cache, name, "eventid_outlierpdu"),
@@ -169,7 +171,7 @@ pub(crate) fn cf_options(cfg: &Config, name: &str, mut opts: Options, cache: &mu
 		&_ => {},
 	}
 
-	opts
+	Ok(opts)
 }
 
 fn set_logging_defaults(opts: &mut Options, config: &Config) {
@@ -325,13 +327,13 @@ fn set_table_with_shared_cache(
 	opts.set_block_based_table_factory(&table);
 }
 
-fn cache_size(config: &Config, base_size: u32, entity_size: usize) -> usize {
+fn cache_size(config: &Config, base_size: u32, entity_size: usize) -> Result<usize> {
 	let ents = f64::from(base_size) * config.cache_capacity_modifier;
 
 	#[allow(clippy::as_conversions, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 	(ents as usize)
 		.checked_mul(entity_size)
-		.expect("cache capacity size is too large")
+		.ok_or_else(|| err!(Config("cache_capacity_modifier", "Cache size is too large.")))
 }
 
 fn table_options(_config: &Config) -> BlockBasedOptions {
@@ -345,4 +347,16 @@ fn table_options(_config: &Config) -> BlockBasedOptions {
 	opts.set_pin_top_level_index_and_filter(true);
 
 	opts
+}
+
+fn num_threads<T: TryFrom<usize>>(config: &Config) -> Result<T> {
+	const MIN_PARALLELISM: usize = 2;
+
+	let requested = if config.rocksdb_parallelism_threads != 0 {
+		config.rocksdb_parallelism_threads
+	} else {
+		utils::available_parallelism()
+	};
+
+	utils::math::try_into::<T, usize>(cmp::max(MIN_PARALLELISM, requested))
 }

@@ -5,13 +5,15 @@ mod request;
 mod response;
 pub mod state;
 
+use std::str::FromStr;
+
 use axum::{
-	response::IntoResponse,
+	response::{IntoResponse, Redirect},
 	routing::{any, get, post},
 	Router,
 };
 use conduit::{err, Server};
-use http::Uri;
+use http::{uri, Uri};
 
 use self::handler::RouterExt;
 pub(super) use self::{args::Args as Ruma, response::RumaResponse, state::State};
@@ -19,7 +21,7 @@ use crate::{client, server};
 
 pub fn build(router: Router<State>, server: &Server) -> Router<State> {
 	let config = &server.config;
-	let router = router
+	let mut router = router
 		.ruma_route(client::get_supported_versions_route)
 		.ruma_route(client::get_register_available_route)
 		.ruma_route(client::register_route)
@@ -138,37 +140,12 @@ pub fn build(router: Router<State>, server: &Server) -> Router<State> {
 		.ruma_route(client::search_events_route)
 		.ruma_route(client::turn_server_route)
 		.ruma_route(client::send_event_to_device_route)
-		.ruma_route(client::get_media_config_route)
-		.ruma_route(client::get_media_preview_route)
 		.ruma_route(client::create_content_route)
-		// legacy v1 media routes
-		.route(
-			"/_matrix/media/v1/preview_url",
-			get(client::get_media_preview_v1_route)
-		)
-		.route(
-			"/_matrix/media/v1/config",
-			get(client::get_media_config_v1_route)
-		)
-		.route(
-			"/_matrix/media/v1/upload",
-			post(client::create_content_v1_route)
-		)
-		.route(
-			"/_matrix/media/v1/download/:server_name/:media_id",
-			get(client::get_content_v1_route)
-		)
-		.route(
-			"/_matrix/media/v1/download/:server_name/:media_id/:file_name",
-			get(client::get_content_as_filename_v1_route)
-		)
-		.route(
-			"/_matrix/media/v1/thumbnail/:server_name/:media_id",
-			get(client::get_content_thumbnail_v1_route)
-		)
+		.ruma_route(client::get_content_thumbnail_route)
 		.ruma_route(client::get_content_route)
 		.ruma_route(client::get_content_as_filename_route)
-		.ruma_route(client::get_content_thumbnail_route)
+		.ruma_route(client::get_media_preview_route)
+		.ruma_route(client::get_media_config_route)
 		.ruma_route(client::get_devices_route)
 		.ruma_route(client::get_device_route)
 		.ruma_route(client::update_device_route)
@@ -202,7 +179,7 @@ pub fn build(router: Router<State>, server: &Server) -> Router<State> {
 		.route("/client/server.json", get(client::syncv3_client_server_json));
 
 	if config.allow_federation {
-		router
+		router = router
 			.ruma_route(server::get_server_version_route)
 			.route("/_matrix/key/v2/server", get(server::get_server_keys_route))
 			.route("/_matrix/key/v2/server/:key_id", get(server::get_server_keys_deprecated_route))
@@ -230,18 +207,75 @@ pub fn build(router: Router<State>, server: &Server) -> Router<State> {
 			.ruma_route(server::get_openid_userinfo_route)
 			.ruma_route(server::get_hierarchy_route)
 			.ruma_route(server::well_known_server)
-			.route("/_conduwuit/local_user_count", get(client::conduwuit_local_user_count))
+			.ruma_route(server::get_content_route)
+			.ruma_route(server::get_content_thumbnail_route)
+			.route("/_conduwuit/local_user_count", get(client::conduwuit_local_user_count));
 	} else {
-		router
+		router = router
 			.route("/_matrix/federation/*path", any(federation_disabled))
 			.route("/.well-known/matrix/server", any(federation_disabled))
 			.route("/_matrix/key/*path", any(federation_disabled))
-			.route("/_conduwuit/local_user_count", any(federation_disabled))
+			.route("/_conduwuit/local_user_count", any(federation_disabled));
 	}
+
+	if config.allow_legacy_media {
+		router = router
+			.ruma_route(client::get_media_config_legacy_route)
+			.ruma_route(client::get_media_preview_legacy_route)
+			.ruma_route(client::get_content_legacy_route)
+			.ruma_route(client::get_content_as_filename_legacy_route)
+			.ruma_route(client::get_content_thumbnail_legacy_route)
+			.route("/_matrix/media/v1/config", get(client::get_media_config_legacy_legacy_route))
+			.route("/_matrix/media/v1/upload", post(client::create_content_legacy_route))
+			.route(
+				"/_matrix/media/v1/preview_url",
+				get(client::get_media_preview_legacy_legacy_route),
+			)
+			.route(
+				"/_matrix/media/v1/download/:server_name/:media_id",
+				get(client::get_content_legacy_legacy_route),
+			)
+			.route(
+				"/_matrix/media/v1/download/:server_name/:media_id/:file_name",
+				get(client::get_content_as_filename_legacy_legacy_route),
+			)
+			.route(
+				"/_matrix/media/v1/thumbnail/:server_name/:media_id",
+				get(client::get_content_thumbnail_legacy_legacy_route),
+			);
+	} else {
+		router = router
+			.route("/_matrix/media/v1/*path", any(legacy_media_disabled))
+			.route("/_matrix/media/v3/config", any(legacy_media_disabled))
+			.route("/_matrix/media/v3/download/*path", any(legacy_media_disabled))
+			.route("/_matrix/media/v3/thumbnail/*path", any(legacy_media_disabled))
+			.route("/_matrix/media/v3/preview_url", any(redirect_legacy_preview));
+	}
+
+	router
+}
+
+async fn redirect_legacy_preview(uri: Uri) -> impl IntoResponse {
+	let path = "/_matrix/client/v1/media/preview_url";
+	let query = uri.query().unwrap_or_default();
+
+	let path_and_query = format!("{path}?{query}");
+	let path_and_query = uri::PathAndQuery::from_str(&path_and_query)
+		.expect("Failed to build PathAndQuery for media preview redirect URI");
+
+	let uri = uri::Builder::new()
+		.path_and_query(path_and_query)
+		.build()
+		.expect("Failed to build URI for redirect")
+		.to_string();
+
+	Redirect::temporary(&uri)
 }
 
 async fn initial_sync(_uri: Uri) -> impl IntoResponse {
 	err!(Request(GuestAccessForbidden("Guest access not implemented")))
 }
 
-async fn federation_disabled() -> impl IntoResponse { err!(Config("allow_federation", "Federation is disabled.")) }
+async fn legacy_media_disabled() -> impl IntoResponse { err!(Request(Forbidden("Unauthenticated media is disabled."))) }
+
+async fn federation_disabled() -> impl IntoResponse { err!(Request(Forbidden("Federation is disabled."))) }

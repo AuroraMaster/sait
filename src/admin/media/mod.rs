@@ -2,7 +2,7 @@ mod commands;
 
 use clap::Subcommand;
 use conduit::Result;
-use ruma::{EventId, MxcUri};
+use ruma::{EventId, MxcUri, OwnedMxcUri, OwnedServerName, ServerName};
 
 use crate::admin_command_dispatch;
 
@@ -32,8 +32,60 @@ pub(super) enum MediaCommand {
 		/// - The duration (at or after), e.g. "5m" to delete all media in the
 		///   past 5 minutes
 		duration: String,
+
 		/// Continues deleting remote media if an undeletable object is found
 		#[arg(short, long)]
 		force: bool,
+	},
+
+	/// - Deletes all the local media from a local user on our server
+	DeleteAllFromUser {
+		username: String,
+
+		/// Continues deleting media if an undeletable object is found
+		#[arg(short, long)]
+		force: bool,
+	},
+
+	/// - Deletes all remote media from the specified remote server
+	DeleteAllFromServer {
+		server_name: Box<ServerName>,
+
+		/// Continues deleting media if an undeletable object is found
+		#[arg(short, long)]
+		force: bool,
+	},
+
+	GetFileInfo {
+		/// The MXC URL to lookup info for.
+		mxc: OwnedMxcUri,
+	},
+
+	GetRemoteFile {
+		/// The MXC URL to fetch
+		mxc: OwnedMxcUri,
+
+		#[arg(short, long)]
+		server: Option<OwnedServerName>,
+
+		#[arg(short, long, default_value("10000"))]
+		timeout: u32,
+	},
+
+	GetRemoteThumbnail {
+		/// The MXC URL to fetch
+		mxc: OwnedMxcUri,
+
+		#[arg(short, long)]
+		server: Option<OwnedServerName>,
+
+		#[arg(short, long, default_value("10000"))]
+		timeout: u32,
+
+		#[arg(short, long)]
+		width: u32,
+
+		#[arg(short, long)]
+		height: u32,
 	},
 }
